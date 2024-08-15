@@ -11,6 +11,9 @@ import (
 type ServiceLevels struct {
 	Dscp     int      `json:"dscp"`
 	Patterns []string `json:"patterns"`
+	LeadDscp  int `json:"leadDscp"`
+	LeadBytes int`json:"leadBytes"`
+
 }
 
 type Conf struct {

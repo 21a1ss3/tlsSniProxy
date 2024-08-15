@@ -78,7 +78,7 @@ func handleClientConnection(cliConn net.Conn, conf *conf.Conf) {
 
 	intermediate := mitm.NewConnectionWrapper(cliConn)
 
-	tlsHelper := goPatchedTls.Server(intermediate, nil)
+	tlsHelper := goPatchedTls.Server(intermediate, &goPatchedTls.Config{})
 
 	log.A.Debug("Reading handshake")
 
@@ -105,6 +105,8 @@ func handleClientConnection(cliConn net.Conn, conf *conf.Conf) {
 	log.A.Infof("extracted SNI: '%v'", serverName)
 
 	dscp := conf.DefaultDscp
+	nextDscp := dscp
+	leadBytes := 0
 
 	fullSrvName := fmt.Sprintf("%v:443", serverName)
 
@@ -120,7 +122,9 @@ func handleClientConnection(cliConn net.Conn, conf *conf.Conf) {
 				}
 
 				if matched {
-					dscp = srvLvl.Dscp
+					dscp = srvLvl.LeadDscp
+					nextDscp = srvLvl.Dscp
+					leadBytes = srvLvl.LeadBytes
 
 					//TODO: emit log about match
 					log.A.Debugf("Found match for server '%v' with pattern '%v'. client = %v", serverName, pattern, cliConn.RemoteAddr())
@@ -162,10 +166,45 @@ func handleClientConnection(cliConn net.Conn, conf *conf.Conf) {
 		srvConn.Close()
 	}()
 
-	_, err = ensureWritten(srvConn, intermediate.ReadBuffer.Bytes())
-	if err != nil {
-		log.A.Debugf("Unable to write initial handshake to server. client = %v, err: %v", cliConn.RemoteAddr(), err)
-		return
+	{
+		firstBytes := intermediate.ReadBuffer.Bytes()
+		originalLen := len(firstBytes)
+		initialLen := leadBytes
+
+		if originalLen < leadBytes {
+			initialLen = originalLen
+		}
+
+		if initialLen > 0 {
+			_, err = ensureWritten(srvConn, firstBytes[:initialLen])
+		}
+		if err != nil {
+			log.A.Debugf("Unable to write initial handshake to server[P1]. client = %v, err: %v", cliConn.RemoteAddr(), err)
+			return
+		}
+
+		tcpSrvConn := srvConn.(*net.TCPConn)
+		srvConnFd, err := tcpSrvConn.File()
+
+		if err != nil {
+			log.A.Errorf("Unable to switch NEXT DCSP (ERR_NO_FD_DESC). client = %v, err: %v", cliConn.RemoteAddr(), err)
+			return
+		}
+
+		err = syscall.SetsockoptInt(int /* */ /*syscall.Handle/* */ (srvConnFd.Fd()), syscall.IPPROTO_IP, syscall.IP_TOS, nextDscp*4)
+
+		if err != nil {
+			log.A.Errorf("Unable to switch NEXT DCSP (ERR_OPT_FAIL). client = %v, err: %v", cliConn.RemoteAddr(), err)
+			return
+		}
+
+		if (originalLen - initialLen) > 0 {
+			_, err = ensureWritten(srvConn, firstBytes[initialLen:originalLen])
+		}
+		if err != nil {
+			log.A.Debugf("Unable to write initial handshake to server[P2]. client = %v, err: %v", cliConn.RemoteAddr(), err)
+			return
+		}
 	}
 
 	log.A.Debugf("Launching forwarding. client = %v", cliConn.RemoteAddr())
